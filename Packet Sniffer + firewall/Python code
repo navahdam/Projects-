@@ -1,0 +1,321 @@
+# Standard libraries
+import sys
+import os
+import json
+import csv
+import threading
+import shutil
+import ipaddress
+from datetime import datetime
+from collections import deque
+
+# PyQt5 GUI libraries
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QLabel, QHBoxLayout,
+    QPushButton, QLineEdit, QTableWidget, QTableWidgetItem,
+    QHeaderView, QMessageBox
+)
+from PyQt5.QtCore import QTimer
+
+# Scapy for packet sniffing
+from scapy.all import sniff, IP, TCP, UDP
+
+# Matplotlib for live graph plotting
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+# File names
+FIREWALL_RULES_FILE = "firewall_rules.json"
+BLOCKED_LOG_FILE = "blocked_packets.csv"
+PACKET_LOG_FILE = "packet_log.csv"
+
+# Sets to store firewall rules
+blocked_ips = set()
+blocked_ports = set()
+blocked_protocols = set()
+
+# Dictionary to keep track of packet counts
+packet_stats = {"blocked": 0, "allowed": 0}
+
+
+# Load firewall rules from JSON file (or use default values if empty)
+def load_firewall_rules():
+    global blocked_ips, blocked_ports, blocked_protocols
+
+    # Default fallback rules
+    default_ips = {"192.168.1.10"}
+    default_ports = {"22", "445"}
+    default_protocols = {"ICMP"}
+
+    if os.path.exists(FIREWALL_RULES_FILE):
+        try:
+            with open(FIREWALL_RULES_FILE, "r") as f:
+                data = json.load(f)
+                blocked_ips.update(data.get("ips", []))
+                blocked_ports.update(data.get("ports", []))
+                blocked_protocols.update(data.get("protocols", []))
+        except Exception:
+            pass
+
+    # If no rules exist, set defaults and save them
+    if not (blocked_ips or blocked_ports or blocked_protocols):
+        blocked_ips.update(default_ips)
+        blocked_ports.update(default_ports)
+        blocked_protocols.update(default_protocols)
+        save_firewall_rules()
+
+
+# Save current firewall rules to a JSON file
+def save_firewall_rules():
+    rules = {
+        "ips": list(blocked_ips),
+        "ports": list(blocked_ports),
+        "protocols": list(blocked_protocols)
+    }
+    with open(FIREWALL_RULES_FILE, "w") as f:
+        json.dump(rules, f, indent=4)
+
+
+# Widget to display real-time graph of packet activity
+class PacketGraphWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.figure = Figure(figsize=(4, 2))  # Create Matplotlib figure
+        self.canvas = FigureCanvas(self.figure)
+        self.ax = self.figure.add_subplot(111)
+        self.layout = QVBoxLayout()
+        self.layout.addWidget(self.canvas)
+        self.setLayout(self.layout)
+
+        self.history = deque(maxlen=30)  # Last 30 seconds of data
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_plot)
+        self.timer.start(1000)  # Update every 1 second
+
+    def update_plot(self):
+        # Append current stats to history
+        self.history.append((packet_stats["allowed"], packet_stats["blocked"]))
+
+        # Clear and redraw the plot
+        self.ax.clear()
+        allowed_vals = [a for a, _ in self.history]
+        blocked_vals = [b for _, b in self.history]
+        x = list(range(len(self.history)))
+
+        # Plot lines
+        self.ax.plot(x, allowed_vals, label="Allowed", color="green")
+        self.ax.plot(x, blocked_vals, label="Blocked", color="red")
+        self.ax.set_title("Packet Activity (Last 30s)")
+        self.ax.set_xlabel("Time (s)")
+        self.ax.set_ylabel("Packets")
+        self.ax.legend()
+        self.canvas.draw()
+
+
+# Main Firewall GUI Class
+class FirewallGUI(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Firewall Rule Manager")
+        self.setGeometry(200, 200, 800, 600)
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+
+        # Add real-time graph to GUI
+        self.graph_widget = PacketGraphWidget()
+        self.layout.addWidget(self.graph_widget)
+
+        # Table to display current firewall rules
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["IP", "Port", "Protocol"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.layout.addWidget(self.table)
+
+        # Input fields for new rule
+        form_layout = QHBoxLayout()
+        self.ip_input = QLineEdit()
+        self.ip_input.setPlaceholderText("IP")
+        self.port_input = QLineEdit()
+        self.port_input.setPlaceholderText("Port")
+        self.protocol_input = QLineEdit()
+        self.protocol_input.setPlaceholderText("Protocol")
+        form_layout.addWidget(self.ip_input)
+        form_layout.addWidget(self.port_input)
+        form_layout.addWidget(self.protocol_input)
+        self.layout.addLayout(form_layout)
+
+        # Buttons for rule operations
+        btn_layout = QHBoxLayout()
+        self.add_btn = QPushButton("Add Rule")
+        self.add_btn.clicked.connect(self.add_rule)
+        self.clear_btn = QPushButton("Clear All")
+        self.clear_btn.clicked.connect(self.clear_rules)
+        self.delete_btn = QPushButton("Delete Selected")
+        self.delete_btn.clicked.connect(self.delete_selected)
+        self.export_btn = QPushButton("Export Logs")
+        self.export_btn.clicked.connect(self.export_logs)
+        btn_layout.addWidget(self.add_btn)
+        btn_layout.addWidget(self.clear_btn)
+        btn_layout.addWidget(self.delete_btn)
+        btn_layout.addWidget(self.export_btn)
+        self.layout.addLayout(btn_layout)
+
+        # Label for packet stats
+        self.status_label = QLabel("Sniffer running... Blocked packets: 0")
+        self.layout.addWidget(self.status_label)
+
+        # Timer to refresh packet count every second
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_status)
+        self.timer.start(1000)
+
+        self.load_table()  # Load table with current rules
+
+    # Load rules into table
+    def load_table(self):
+        self.table.setRowCount(0)
+        for ip in sorted(blocked_ips):
+            self.insert_row(ip, "", "")
+        for port in sorted(blocked_ports):
+            self.insert_row("", port, "")
+        for proto in sorted(blocked_protocols):
+            self.insert_row("", "", proto.upper())
+
+    # Insert a rule row into the table
+    def insert_row(self, ip, port, proto):
+        row_pos = self.table.rowCount()
+        self.table.insertRow(row_pos)
+        self.table.setItem(row_pos, 0, QTableWidgetItem(ip))
+        self.table.setItem(row_pos, 1, QTableWidgetItem(port))
+        self.table.setItem(row_pos, 2, QTableWidgetItem(proto))
+
+    # Add new rule
+    def add_rule(self):
+        ip = self.ip_input.text().strip()
+        port = self.port_input.text().strip()
+        proto = self.protocol_input.text().strip().upper()
+
+        if not ip and not port and not proto:
+            QMessageBox.warning(self, "Invalid Input", "Please enter at least one value.")
+            return
+
+        try:
+            if ip:
+                ipaddress.ip_address(ip)
+                blocked_ips.add(ip)
+            if port:
+                int(port)
+                blocked_ports.add(port)
+            if proto:
+                if proto not in {"TCP", "UDP", "ICMP"}:
+                    raise ValueError("Unsupported protocol")
+                blocked_protocols.add(proto)
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid Input", str(e))
+            return
+
+        save_firewall_rules()
+        self.load_table()
+        self.ip_input.clear()
+        self.port_input.clear()
+        self.protocol_input.clear()
+
+    # Clear all rules
+    def clear_rules(self):
+        reply = QMessageBox.question(self, 'Clear All?', 'Are you sure you want to clear all rules?',
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            blocked_ips.clear()
+            blocked_ports.clear()
+            blocked_protocols.clear()
+            save_firewall_rules()
+            self.load_table()
+
+    # Delete selected rule from table
+    def delete_selected(self):
+        selected = self.table.selectedItems()
+        if not selected:
+            return
+
+        for item in selected:
+            row = item.row()
+            ip = self.table.item(row, 0).text()
+            port = self.table.item(row, 1).text()
+            proto = self.table.item(row, 2).text().upper()
+
+            if ip: blocked_ips.discard(ip)
+            if port: blocked_ports.discard(port)
+            if proto: blocked_protocols.discard(proto)
+
+        save_firewall_rules()
+        self.load_table()
+
+    # Update live status label
+    def update_status(self):
+        self.status_label.setText(
+            f"Sniffer running... Blocked: {packet_stats['blocked']} | Allowed: {packet_stats['allowed']}"
+        )
+
+    # Export logs to external files
+    def export_logs(self):
+        try:
+            shutil.copy(BLOCKED_LOG_FILE, "exported_blocked_packets.csv")
+            shutil.copy(PACKET_LOG_FILE, "exported_packet_log.csv")
+            QMessageBox.information(self, "Export Complete", "Logs exported successfully.")
+        except Exception as e:
+            QMessageBox.warning(self, "Export Failed", str(e))
+
+
+# This function is called for every sniffed packet
+def packet_callback(pkt):
+    if IP in pkt:
+        src_ip = pkt[IP].src
+        dst_ip = pkt[IP].dst
+        proto = pkt.proto
+        proto_name = {1: "ICMP", 6: "TCP", 17: "UDP"}.get(proto, str(proto)).upper()
+        dst_port = str(pkt[TCP].dport) if TCP in pkt else str(pkt[UDP].dport) if UDP in pkt else ""
+        src_port = str(pkt[TCP].sport) if TCP in pkt else str(pkt[UDP].sport) if UDP in pkt else ""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Log all packets with header
+        packet_file_exists = os.path.exists(PACKET_LOG_FILE)
+        with open(PACKET_LOG_FILE, mode='a', newline='') as packet_file:
+            writer = csv.writer(packet_file)
+            if not packet_file_exists or os.path.getsize(PACKET_LOG_FILE) == 0:
+                writer.writerow(["Timestamp", "Source IP", "Source Port", "Destination IP", "Destination Port", "Protocol"])
+            writer.writerow([timestamp, src_ip, src_port, dst_ip, dst_port, proto_name])
+
+        # Check if packet should be blocked
+        if src_ip in blocked_ips or dst_port in blocked_ports or proto_name in blocked_protocols:
+            blocked_file_exists = os.path.exists(BLOCKED_LOG_FILE)
+            with open(BLOCKED_LOG_FILE, mode='a', newline='') as log_file:
+                writer = csv.writer(log_file)
+                if not blocked_file_exists or os.path.getsize(BLOCKED_LOG_FILE) == 0:
+                    writer.writerow(["Timestamp", "Source IP", "Destination Port", "Protocol"])
+                writer.writerow([timestamp, src_ip, dst_port, proto_name])
+            packet_stats["blocked"] += 1
+            print(f"[BLOCKED] {src_ip} -> {dst_ip}:{dst_port} [{proto_name}]")
+        else:
+            packet_stats["allowed"] += 1
+            print(f"[ALLOWED] {src_ip}:{src_port} -> {dst_ip}:{dst_port} [{proto_name}]")
+
+
+# Start Scapy sniffer in a separate thread
+def start_sniffer():
+    print("[INFO] Starting packet sniffer...")
+    sniff(prn=packet_callback, store=0)
+
+
+# Main entry point
+if __name__ == "__main__":
+    load_firewall_rules()
+
+    # Start sniffing thread
+    sniffer_thread = threading.Thread(target=start_sniffer, daemon=True)
+    sniffer_thread.start()
+
+    # Start GUI event loop
+    app = QApplication(sys.argv)
+    window = FirewallGUI()
+    window.show()
+    sys.exit(app.exec_())
