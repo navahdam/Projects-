@@ -29,14 +29,17 @@ from PyQt5.QtGui import QIcon
 import matplotlib.gridspec as gridspec
 from scapy.all import sniff, IP, TCP, UDP, ICMP
 
+# File paths for firewall rules and packet logs
 FIREWALL_RULES_FILE = "firewall_rules.json"
 BLOCKED_LOG_FILE = "blocked_packets.csv"
 PACKET_LOG_FILE = "packet_log.csv"
 
+# Sets for blocked IPs, ports, and protocols
 blocked_ips = set()
 blocked_ports = set()
 blocked_protocols = set()
 
+# Deques to hold data for plotting
 time_labels = deque(maxlen=300)
 allowed_counts = deque(maxlen=300)
 blocked_counts = deque(maxlen=300)
@@ -44,7 +47,7 @@ protocol_counter = Counter()
 
 main_window = None
 
-
+# Load saved firewall rules or initialize default ones
 def load_firewall_rules():
     global blocked_ips, blocked_ports, blocked_protocols
     default_ips = {"192.168.1.10"}
@@ -65,7 +68,7 @@ def load_firewall_rules():
         blocked_protocols.update(default_protocols)
         save_firewall_rules()
 
-
+# Save current firewall rules to file
 def save_firewall_rules():
     rules = {
         "ips": list(blocked_ips),
@@ -75,7 +78,7 @@ def save_firewall_rules():
     with open(FIREWALL_RULES_FILE, "w") as f:
         json.dump(rules, f, indent=4)
 
-
+# Firewall control window for managing rules
 class FirewallControlGUI(QWidget):
     def __init__(self):
         super().__init__()
@@ -83,6 +86,7 @@ class FirewallControlGUI(QWidget):
         self.setGeometry(300, 300, 500, 400)
         layout = QVBoxLayout()
 
+        # Input fields for new rules
         form = QHBoxLayout()
         self.ip_input = QLineEdit()
         self.ip_input.setPlaceholderText("Block IP")
@@ -95,6 +99,7 @@ class FirewallControlGUI(QWidget):
         form.addWidget(self.proto_input)
         layout.addLayout(form)
 
+        # Buttons to add or delete rules
         btns = QHBoxLayout()
         self.add_rule_btn = QPushButton("Add Rule")
         self.del_rule_btn = QPushButton("Delete Rule")
@@ -102,6 +107,7 @@ class FirewallControlGUI(QWidget):
         btns.addWidget(self.del_rule_btn)
         layout.addLayout(btns)
 
+        # Display of current active rules
         self.rule_list = QListWidget()
         layout.addWidget(QLabel("Active Firewall Rules:"))
         layout.addWidget(self.rule_list)
@@ -113,6 +119,7 @@ class FirewallControlGUI(QWidget):
 
         self.refresh_rule_list()
 
+    # Add new rule to appropriate set
     def add_rule(self):
         ip = self.ip_input.text().strip()
         port = self.port_input.text().strip()
@@ -126,6 +133,7 @@ class FirewallControlGUI(QWidget):
         save_firewall_rules()
         self.refresh_rule_list()
 
+    # Delete selected rule from set
     def delete_rule(self):
         selected = self.rule_list.selectedItems()
         for item in selected:
@@ -139,6 +147,7 @@ class FirewallControlGUI(QWidget):
         save_firewall_rules()
         self.refresh_rule_list()
 
+    # Refresh the rule list UI display
     def refresh_rule_list(self):
         self.rule_list.clear()
         for ip in blocked_ips:
@@ -148,7 +157,7 @@ class FirewallControlGUI(QWidget):
         for proto in blocked_protocols:
             self.rule_list.addItem(QListWidgetItem(f"Proto: {proto}"))
 
-
+# Main window that displays graphs and alerts
 class GraphMonitorGUI(QWidget):
     def __init__(self):
         super().__init__()
@@ -157,10 +166,12 @@ class GraphMonitorGUI(QWidget):
 
         layout = QVBoxLayout()
 
+        # System tray alert icon
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
         self.tray_icon.show()
 
+        # Top controls: graph type selector, refresh, firewall GUI
         controls = QHBoxLayout()
         self.combo = QComboBox()
         self.combo.addItems(["Line Graph", "Bar Graph"])
@@ -178,6 +189,7 @@ class GraphMonitorGUI(QWidget):
         controls.addWidget(self.fw_btn)
         layout.addLayout(controls)
 
+        # Graph area setup
         self.figure = plt.figure(figsize=(12, 6))
         gs = gridspec.GridSpec(3, 2)
         self.ax1 = self.figure.add_subplot(gs[0:2, :])
@@ -189,14 +201,17 @@ class GraphMonitorGUI(QWidget):
         layout.addWidget(self.canvas)
         self.setLayout(layout)
 
+        # Auto-refresh timer for graphs
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_graphs)
         self.timer.start(2000)
 
+    # Open the firewall control window
     def launch_firewall_gui(self):
         self.fw_window = FirewallControlGUI()
         self.fw_window.show()
 
+    # Draw and update all graphs in GUI
     def update_graphs(self):
         self.ax1.clear()
         self.ax2.clear()
@@ -237,10 +252,11 @@ class GraphMonitorGUI(QWidget):
 
         self.canvas.draw()
 
+    # Trigger system tray notification
     def show_alert(self, msg):
         self.tray_icon.showMessage("Firewall Alert", msg, QSystemTrayIcon.Warning)
 
-
+# Analyze each captured packet and apply firewall rules
 def packet_callback(pkt):
     if IP in pkt:
         src_ip = pkt[IP].src
@@ -278,12 +294,13 @@ def packet_callback(pkt):
             allowed_counts.append(allowed_counts[-1] + 1 if allowed_counts else 1)
             print(f"[ALLOWED] {src_ip}:{src_port} -> {dst_ip}:{dst_port} [{proto_name}]")
 
+# Background thread to capture packets
 
 def start_sniffer():
     print("[INFO] Starting packet sniffer...")
     sniff(prn=packet_callback, store=0)
 
-
+# Main application entry point
 if __name__ == "__main__":
     load_firewall_rules()
     sniffer_thread = threading.Thread(target=start_sniffer, daemon=True)
