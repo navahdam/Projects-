@@ -102,6 +102,8 @@ bash
 Copy
 Edit
 sudo python your_script.py
+
+
 On Windows:
 Run from an elevated Command Prompt or use Python IDE as Admin
 
