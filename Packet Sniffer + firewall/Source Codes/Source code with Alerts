@@ -1,0 +1,380 @@
+# Core modules
+import sys  # Provides access to system-specific parameters and functions
+import os  # Provides a way of using operating system dependent functionality
+import json  # Used for reading and writing firewall rules in JSON format
+import threading  # Used for running the packet sniffer in a separate thread
+import queue  # Thread-safe queue to store packets temporarily
+
+from datetime import datetime  # Used to timestamp each captured packet
+from collections import Counter  # Helps in counting protocol occurrences for the graph
+
+# PyQt5 modules for GUI components
+from PyQt5.QtWidgets import (
+    QApplication,  # Initializes the Qt application
+    QWidget,  # Base class for all UI objects
+    QVBoxLayout, QHBoxLayout,  # Layout managers for vertical and horizontal arrangements
+    QLabel, QPushButton,  # UI components for text labels and buttons
+    QTextEdit, QLineEdit, QFileDialog, QListWidget, QMessageBox  # Widgets for text input, file dialogs, lists, alerts
+)
+
+from PyQt5.QtGui import QTextCursor, QTextCharFormat, QColor  # Controls cursor and formatting in QTextEdit
+from PyQt5.QtCore import QTimer  # For running functions at timed intervals
+
+# Scapy library for packet sniffing
+from scapy.all import sniff, IP, TCP, UDP, ICMP  # Import necessary protocols and the sniffing tool
+
+# Matplotlib for plotting protocol graphs
+import matplotlib.pyplot as plt  # Core plotting library
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas  # Embeds matplotlib in PyQt5
+
+# ---------------------- Global Variables ----------------------
+packet_queue = queue.Queue()  # Stores captured packets for GUI consumption
+saved_packets = []  # Stores all packets captured during session for filtering and saving
+blocked_ips = set()  # Set of blocked IP addresses
+blocked_ports = set()  # Set of blocked ports
+blocked_protocols = set()  # Set of blocked protocols (TCP, UDP, etc.)
+FIREWALL_RULES_FILE = "firewall_rules.json"  # File to persist firewall rules
+alerts_enabled = True  # Global toggle to enable/disable real-time alerts
+
+
+
+def load_firewall_rules():
+    """Load existing firewall rules from a JSON file into memory."""
+    global blocked_ips, blocked_ports, blocked_protocols  # Access global rule sets
+    if os.path.exists(FIREWALL_RULES_FILE):  # Check if the rules file exists
+        with open(FIREWALL_RULES_FILE, 'r') as f:  # Open the file in read mode
+            data = json.load(f)  # Parse JSON data
+            blocked_ips = set(data.get("ips", []))  # Load blocked IPs
+            blocked_ports = set(data.get("ports", []))  # Load blocked ports
+            blocked_protocols = set(data.get("protocols", []))  # Load blocked protocols
+    else:
+        save_firewall_rules()  # If file doesn't exist, create it with empty rule sets
+
+
+def save_firewall_rules():
+    """Save current firewall rules to a JSON file."""
+    rules = {
+        "ips": list(blocked_ips),  # Convert sets to lists for JSON compatibility
+        "ports": list(blocked_ports),
+        "protocols": list(blocked_protocols)
+    }
+    with open(FIREWALL_RULES_FILE, "w") as f:  # Write to file in write mode
+        json.dump(rules, f, indent=4)  # Save as JSON with readable indentation
+
+
+
+def packet_callback(pkt):
+    """Process each captured packet and determine if it's blocked or allowed."""
+    if IP in pkt:  # Ensure packet contains an IP layer
+        src_ip = pkt[IP].src  # Extract source IP
+        dst_ip = pkt[IP].dst  # Extract destination IP
+        proto = pkt.proto  # Get protocol number (1=ICMP, 6=TCP, 17=UDP)
+        proto_name = {1: "ICMP", 6: "TCP", 17: "UDP"}.get(proto, str(proto))  # Translate to name
+
+        # Extract ports if available
+        dst_port = str(pkt[TCP].dport) if TCP in pkt else str(pkt[UDP].dport) if UDP in pkt else ""
+        src_port = str(pkt[TCP].sport) if TCP in pkt else str(pkt[UDP].sport) if UDP in pkt else ""
+
+        # Generate timestamp
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        # Check if the packet should be blocked
+        blocked = (
+            src_ip in blocked_ips or
+            dst_port in blocked_ports or
+            proto_name in blocked_protocols
+        )
+        tag = "[Blocked]" if blocked else "[Allowed]"  # Label packet
+
+        # Construct log line
+        line = f"{timestamp} {tag} {src_ip}:{src_port} -> {dst_ip}:{dst_port} | {proto_name} Packet on port {dst_port}"
+
+        # Add packet to queue for display
+        packet_queue.put((line, proto_name, blocked))
+
+
+def start_sniffer():
+    """Start packet capture using Scapy in the background."""
+    sniff(prn=packet_callback, store=0)  # Call packet_callback for every captured packet
+    
+class FirewallManager(QWidget):
+    """UI for viewing, adding, and deleting firewall rules."""
+    def __init__(self):
+        super().__init__()  # Initialize QWidget
+        self.setWindowTitle("Firewall Rule Manager")  # Set window title
+        self.setGeometry(100, 100, 400, 350)  # Define window size and position
+
+        layout = QVBoxLayout()  # Main vertical layout
+
+        # Input fields for rules
+        self.ip_input = QLineEdit(); self.ip_input.setPlaceholderText("Block IP")
+        self.port_input = QLineEdit(); self.port_input.setPlaceholderText("Block Port")
+        self.protocol_input = QLineEdit(); self.protocol_input.setPlaceholderText("Block Protocol (TCP, UDP, ICMP)")
+
+        # Buttons for rule management
+        add_btn = QPushButton("Add Rule"); add_btn.clicked.connect(self.add_rule)
+        delete_btn = QPushButton("Delete Selected Rule"); delete_btn.clicked.connect(self.delete_rule)
+        save_btn = QPushButton("Save Rules to JSON"); save_btn.clicked.connect(save_firewall_rules)
+
+        # List view of current rules
+        self.rule_list = QListWidget()
+        self.load_rules_into_list()  # Load rules into the list view
+
+        # Add widgets to layout
+        layout.addWidget(self.ip_input)
+        layout.addWidget(self.port_input)
+        layout.addWidget(self.protocol_input)
+        layout.addWidget(add_btn)
+        layout.addWidget(delete_btn)
+        layout.addWidget(save_btn)
+        layout.addWidget(self.rule_list)
+        self.setLayout(layout)
+
+    def load_rules_into_list(self):
+        """Load current firewall rules into the list widget."""
+        self.rule_list.clear()  # Clear existing items
+        for ip in blocked_ips: self.rule_list.addItem(f"IP: {ip}")
+        for port in blocked_ports: self.rule_list.addItem(f"Port: {port}")
+        for proto in blocked_protocols: self.rule_list.addItem(f"Protocol: {proto}")
+
+    def add_rule(self):
+        """Add a new rule from input fields."""
+        ip = self.ip_input.text().strip()
+        port = self.port_input.text().strip()
+        proto = self.protocol_input.text().strip().upper()
+        if ip: blocked_ips.add(ip)
+        if port: blocked_ports.add(port)
+        if proto: blocked_protocols.add(proto)
+        save_firewall_rules()
+        self.load_rules_into_list()
+        self.ip_input.clear(); self.port_input.clear(); self.protocol_input.clear()
+
+    def delete_rule(self):
+        """Delete selected rule from memory and GUI."""
+        selected_item = self.rule_list.currentItem()
+        if not selected_item: return
+        rule_text = selected_item.text()
+        if rule_text.startswith("IP: "): blocked_ips.discard(rule_text.split("IP: ")[1].strip())
+        elif rule_text.startswith("Port: "): blocked_ports.discard(rule_text.split("Port: ")[1].strip())
+        elif rule_text.startswith("Protocol: "): blocked_protocols.discard(rule_text.split("Protocol: ")[1].strip())
+        save_firewall_rules()
+        self.load_rules_into_list()
+
+
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QComboBox, QHBoxLayout, QLabel
+from PyQt5.QtCore import QTimer
+from collections import Counter
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+
+class GraphViewer(QWidget):
+    """UI component for displaying protocol distribution pie chart."""
+    
+    def __init__(self):
+        super().__init__()  # Initialize QWidget
+        self.setWindowTitle("Protocol Distribution")  # Set window title
+        self.setGeometry(100, 100, 550, 450)  # Set window size and position
+
+        layout = QVBoxLayout()  # Create main vertical layout
+        self.figure = plt.figure()  # Create a matplotlib figure
+        self.canvas = FigureCanvas(self.figure)  # Embed figure in a PyQt canvas
+
+        # Create layout for control buttons (refresh, interval)
+        control_layout = QHBoxLayout()
+
+        self.refresh_btn = QPushButton("Manual Refresh")  # Button to manually refresh graph
+        self.refresh_btn.clicked.connect(self.plot_graph)  # Connect to graph plotting method
+
+        self.auto_refresh_toggle = QPushButton("Stop Auto-Refresh")  # Toggle for auto-refresh
+        self.auto_refresh_toggle.setCheckable(True)  # Make button togglable
+        self.auto_refresh_toggle.setChecked(True)  # Initially set to checked (enabled)
+        self.auto_refresh_toggle.clicked.connect(self.toggle_auto_refresh)  # Connect toggle logic
+
+        self.interval_selector = QComboBox()  # Dropdown for selecting refresh interval
+        self.interval_selector.addItems(["5", "10", "30", "60"])  # Interval options in seconds
+        self.interval_selector.currentIndexChanged.connect(self.update_interval)  # Connect to update logic
+
+        # Add controls to layout
+        control_layout.addWidget(QLabel("Interval (s):"))
+        control_layout.addWidget(self.interval_selector)
+        control_layout.addWidget(self.refresh_btn)
+        control_layout.addWidget(self.auto_refresh_toggle)
+
+        layout.addWidget(self.canvas)  # Add graph canvas
+        layout.addLayout(control_layout)  # Add control layout to main layout
+        self.setLayout(layout)
+
+        # Set up a timer for automatic updates
+        self.timer = QTimer(self)  # Timer for scheduling auto-refresh
+        self.timer.timeout.connect(self.plot_graph)  # Trigger plot_graph when timeout occurs
+        self.timer.start(5000)  # Start with 5-second interval
+
+        self.plot_graph()  # Plot initial graph
+
+    def plot_graph(self):
+        """Draw a pie chart of protocol usage."""
+        self.figure.clear()  # Clear the previous plot
+        ax = self.figure.add_subplot(111)  # Add subplot to figure
+
+        # Count protocols in saved packets
+        proto_counts = Counter(proto for _, proto, _ in saved_packets)
+        labels = list(proto_counts.keys())  # Protocol names
+        sizes = list(proto_counts.values())  # Count of each protocol
+
+        # Only plot if there is data
+        if sizes:
+            ax.pie(sizes, labels=labels, autopct='%1.1f%%')  # Draw pie chart
+            ax.set_title("Protocol Distribution (Live)")  # Title
+        else:
+            ax.text(0.5, 0.5, "No Data Yet", ha='center', va='center')  # Display fallback message
+        self.canvas.draw()  # Render the chart
+
+    def update_interval(self):
+        """Change auto-refresh interval based on dropdown."""
+        seconds = int(self.interval_selector.currentText())  # Get new interval
+        self.timer.setInterval(seconds * 1000)  # Update timer interval (ms)
+
+    def toggle_auto_refresh(self):
+        """Toggle auto-refresh on or off."""
+        if self.auto_refresh_toggle.isChecked():
+            self.timer.start()  # Start auto-refresh
+            self.auto_refresh_toggle.setText("Stop Auto-Refresh")
+        else:
+            self.timer.stop()  # Stop auto-refresh
+            self.auto_refresh_toggle.setText("Start Auto-Refresh")
+
+
+
+class LivePacketViewer(QWidget):
+    """Main GUI showing real-time packets, filters, alerts, and control options."""
+    
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Live Packet Capture")  # Window title
+        self.setGeometry(100, 100, 800, 500)  # Set size and position
+        layout = QVBoxLayout()  # Main layout
+
+        # Top row of control buttons
+        control_layout = QHBoxLayout()
+        self.open_graph_btn = QPushButton("Open Graph Viewer")
+        self.open_graph_btn.clicked.connect(self.open_graph)
+        self.open_firewall_btn = QPushButton("Open Firewall Controls")
+        self.open_firewall_btn.clicked.connect(self.open_firewall)
+        self.alert_toggle_btn = QPushButton("Disable Alerts")
+        self.alert_toggle_btn.clicked.connect(self.toggle_alerts)
+        control_layout.addWidget(self.open_graph_btn)
+        control_layout.addWidget(self.open_firewall_btn)
+        control_layout.addWidget(self.alert_toggle_btn)
+        layout.addLayout(control_layout)
+
+        # Filter inputs
+        self.protocol_filter = QLineEdit(); self.protocol_filter.setPlaceholderText("Filter by Protocol (e.g. TCP)")
+        self.port_filter = QLineEdit(); self.port_filter.setPlaceholderText("Filter by Port (e.g. 80)")
+        self.apply_btn = QPushButton("Apply Filter"); self.apply_btn.clicked.connect(self.apply_filter)
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(self.protocol_filter)
+        filter_layout.addWidget(self.port_filter)
+        filter_layout.addWidget(self.apply_btn)
+        layout.addLayout(filter_layout)
+
+        # Output display
+        self.output_area = QTextEdit(); self.output_area.setReadOnly(True)
+        layout.addWidget(self.output_area)
+
+        # Save and clear buttons
+        button_layout = QHBoxLayout()
+        self.save_btn = QPushButton("Save Filtered Packets")
+        self.save_btn.clicked.connect(self.save_packets)
+        self.clear_btn = QPushButton("Clear View")
+        self.clear_btn.clicked.connect(self.clear_output)
+        button_layout.addWidget(self.save_btn)
+        button_layout.addWidget(self.clear_btn)
+        layout.addLayout(button_layout)
+
+        self.setLayout(layout)  # Set the complete layout
+
+        # Setup update timer for pulling new packets
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_output)
+        self.timer.start(1000)  # Update every 1 second
+
+        # Placeholder windows for graph and firewall managers
+        self.graph_window = None
+        self.firewall_window = None
+
+    def update_output(self):
+        """Fetch packets from queue, display, and trigger alerts."""
+        global alerts_enabled
+        while not packet_queue.empty():
+            line, proto, blocked = packet_queue.get()
+            saved_packets.append((line, proto, blocked))
+            if self.passes_filter(line, proto):
+                self.append_output(line, blocked)
+            if alerts_enabled and blocked:
+                QMessageBox.warning(self, "Blocked Packet Alert", line)  # Alert popup
+
+    def passes_filter(self, line, proto):
+        """Check if packet passes current filter criteria."""
+        proto_filter = self.protocol_filter.text().strip().upper()
+        port_filter = self.port_filter.text().strip()
+        if proto_filter and proto.upper() != proto_filter:
+            return False
+        if port_filter and f"port {port_filter}" not in line:
+            return False
+        return True
+
+    def append_output(self, text, blocked):
+        """Add a colored line to the output area."""
+        cursor = self.output_area.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("red") if blocked else QColor("green"))
+        cursor.insertText(text + "\n", fmt)
+        self.output_area.setTextCursor(cursor)
+
+    def clear_output(self):
+        """Clear all packet output."""
+        self.output_area.clear()
+
+    def apply_filter(self):
+        """Re-apply the current filter and refresh view."""
+        self.clear_output()
+        for line, proto, blocked in saved_packets:
+            if self.passes_filter(line, proto):
+                self.append_output(line, blocked)
+
+    def save_packets(self):
+        """Save current visible packets to a file."""
+        filename, _ = QFileDialog.getSaveFileName(self, "Save Packets", "", "Text Files (*.txt)")
+        if filename:
+            with open(filename, "w") as f:
+                f.write(self.output_area.toPlainText())
+
+    def toggle_alerts(self):
+        """Toggle alert popup on or off."""
+        global alerts_enabled
+        alerts_enabled = not alerts_enabled
+        self.alert_toggle_btn.setText("Enable Alerts" if not alerts_enabled else "Disable Alerts")
+
+    def open_graph(self):
+        """Open protocol distribution viewer."""
+        if not self.graph_window:
+            self.graph_window = GraphViewer()
+        self.graph_window.show()
+
+    def open_firewall(self):
+        """Open firewall rule manager window."""
+        if not self.firewall_window:
+            self.firewall_window = FirewallManager()
+        self.firewall_window.show()
+
+#App entry 
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)  # Create QApplication instance
+    load_firewall_rules()  # Load rules before sniffing begins
+    sniffer_thread = threading.Thread(target=start_sniffer, daemon=True)  # Create background sniffer thread
+    sniffer_thread.start()  # Start sniffing
+    main_window = LivePacketViewer()  # Launch main UI
+    main_window.show()  # Show main window
+    sys.exit(app.exec_())  # Run the Qt application loop
