@@ -35,6 +35,10 @@ Filter packets by protocol and/or port
 
 Export filtered packet logs to a .txt file
 
+✅ Real-Time Alerts 
+
+ Alerts of blocked ports, IPs, Protocols.
+
 
 ✅ User-Friendly GUI
 
